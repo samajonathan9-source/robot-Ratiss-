@@ -315,7 +315,7 @@ class RatisBrain:
             if self._dialogue is None:
                 self._dialogue = DialogueEngine()
             r = self._dialogue.answer(question)
-            if r["found"] and r["confidence"] > 0.55:
+            if r["found"] and r["confidence"] >= 0.55:
                 return r["response"]
         except ImportError:
             pass

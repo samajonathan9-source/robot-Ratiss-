@@ -195,7 +195,7 @@ class DialogueEngine:
     dit honnêtement « je ne sais pas » (ne hallucine pas).
     """
 
-    def __init__(self, knowledge_base=None, dim: int = 10, threshold: float = 0.3,
+    def __init__(self, knowledge_base=None, dim: int = 10, threshold: float = 0.45,
                  use_topo: bool = True):
         self.dim = dim
         self.threshold = threshold
@@ -227,12 +227,14 @@ class DialogueEngine:
         cadre (LCT), les mots-clés sont un complément pour le sens.
         """
         stop = {"le", "la", "les", "un", "une", "des", "de", "du", "et", "ou",
-                "est", "es", "tu", "te", "se", "ce", "ca", "ça", "que", "qui",
+                "est", "es", "tu", "te", "se", "ce", "ca", "ça", "que",
                 "quoi", "comment", "pourquoi", "as", "au", "aux", "mon", "ma",
                 "mes", "ton", "ta", "son", "sa", "a", "il", "elle", "on", "ne",
                 "pas", "me", "moi", "toi", "dis", "parle", "donne", "via"}
-        w1 = {w for w in q1.lower().replace("'-", " ").split() if len(w) >= 3 and w not in stop}
-        w2 = {w for w in q2.lower().replace("'-", " ").split() if len(w) >= 3 and w not in stop}
+        # normalisation : tirets/apostrophes → espaces ("qui es-tu" = "qui est tu")
+        norm = lambda s: s.lower().replace("-", " ").replace("'", " ").replace("’", " ")
+        w1 = {w for w in norm(q1).split() if len(w) >= 2 and w not in stop}
+        w2 = {w for w in norm(q2).split() if len(w) >= 2 and w not in stop}
         if not w1 or not w2:
             return 0.0
         return len(w1 & w2) / max(len(w1 | w2), 1)
