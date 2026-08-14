@@ -1,14 +1,15 @@
 """interface.server — Serveur web local pour le robot RATIS.
 
 Déploie une interface web où RATIS voit (caméra), sent (capteurs), pense (LCT),
-ressent (ETH), parle (décodeur), et certifie (ZK) — en temps réel, dans le
-navigateur. Souverain : 100% local, pas de cloud.
+ressent (ETH), parle (décodeur + TTS gTTS), et certifie (ZK) — en temps réel.
+Souverain : cognition 100% locale, gTTS pour la voix.
 
 Endpoints :
-  GET  /            — l'interface web (HTML + JS)
-  GET  /api/video   — flux caméra (MJPEG)
-  GET  /api/think   — une boucle cognitive (JSON : perception, émotion, décision, ZK)
-  POST /api/chat    — poser une question à RATIS (dialogue engine)
+  GET  /            — interface web (HTML + JS)
+  GET  /api/video   — flux caméra (MJPEG, annoté avec l'état cognitif)
+  GET  /api/think   — une boucle cognitive (JSON)
+  POST /api/chat    — poser une question à RATIS (dialogue engine complet)
+  POST /api/speak   — synthèse vocale (gTTS → MP3)
   GET  /api/health  — santé du robot
 """
 from __future__ import annotations
@@ -98,9 +99,29 @@ async def chat(req: ChatRequest):
     return JSONResponse({"question": req.question, "response": response})
 
 
+class SpeakRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/speak")
+async def speak(req: SpeakRequest):
+    """Synthèse vocale gTTS → MP3 (pour que RATIS parle à voix haute)."""
+    try:
+        from gtts import gTTS
+        import tempfile, os
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False, dir="/tmp")
+        tts = gTTS(text=req.text, lang="fr", slow=False)
+        tts.save(tmp.name)
+        audio = open(tmp.name, "rb").read()
+        os.unlink(tmp.name)
+        return Response(content=audio, media_type="audio/mpeg")
+    except Exception as e:
+        return JSONResponse({"error": f"TTS indisponible: {e}"}, status_code=500)
+
+
 @app.get("/api/video")
 async def video():
-    """Flux caméra MJPEG (si webcam dispo)."""
+    """Flux caméra MJPEG annoté avec l'état cognitif (si webcam dispo)."""
     r = get_robot()
     if r._cap is None:
         return Response(status_code=404, content="Pas de caméra")
@@ -112,6 +133,12 @@ async def video():
                 continue
             try:
                 import cv2
+                # annotation : émotion + action + ZK sur la frame
+                d = r.brain.history[-1] if r.brain.history else None
+                if d:
+                    txt = f"{d.emotion.emotion} | {d.action} | ZK:{d.zk_hash[:8]}"
+                    cv2.putText(frame, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7, (0, 255, 0), 2)
                 _, buf = cv2.imencode(".jpg", frame)
                 yield (b"--frame\r\n"
                        b"Content-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
@@ -200,6 +227,7 @@ INTERFACE_HTML = """<!DOCTYPE html>
     <div class="chat-input">
       <input id="chat-input" placeholder="Pose une question à RATIS..." onkeypress="if(event.key==='Enter')sendChat()">
       <button onclick="sendChat()">Envoyer</button>
+      <button onclick="speakLast()" style="background:#16a085">🔊 Parler</button>
     </div>
   </div>
 </div>
@@ -241,6 +269,24 @@ async function sendChat() {
 }
 think();
 setInterval(think, 1000);
+async function speakLast() {
+  const msgs = document.querySelectorAll('.chat-msg.ratis');
+  if (msgs.length === 0) return;
+  const text = msgs[msgs.length - 1].textContent;
+  const r = await fetch('/api/speak', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text:text})});
+  if (r.ok) {
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    audio.play();
+  }
+}
+async function speakPhrase() {
+  const text = document.getElementById('phrase').textContent.replace(/[«»]/g,'').trim();
+  if (!text || text === 'Initialisation...') return;
+  const r = await fetch('/api/speak', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text:text})});
+  if (r.ok) { const blob = await r.blob(); const audio = new Audio(URL.createObjectURL(blob)); audio.play(); }
+}
 </script>
 </body>
 </html>"""
