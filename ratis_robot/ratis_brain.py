@@ -25,12 +25,9 @@ from pathlib import Path
 
 import numpy as np
 
-# Import du cerveau RATIS depuis le dépôt Ratiss-experimental-IA- (voisin)
-_EXPERIMENTAL = Path(__file__).resolve().parents[2] / "Ratiss-experimental-IA-"
-_AEON = Path(__file__).resolve().parents[2] / "RATISS-ODV-AEON"
-for p in [_EXPERIMENTAL, _AEON]:
-    if p.is_dir() and str(p) not in sys.path:
-        sys.path.append(str(p))
+# le cerveau RATIS est maintenant LOCAL (copié dans ratis_robot/) — autonome
+from ratis_robot.ttf_bridge import ttf_embedding, is_ttf_available
+from ratis_robot.topo_tokenizer import topo_signature
 
 
 @dataclass
@@ -68,6 +65,15 @@ class RatisBrain:
 
     Prend des frames caméra + des capteurs, produit une décision certifiée.
     Souverain : 100% local, pas de cloud, pas de LLM externe.
+
+    Le dialogue combine deux modes (honnête) :
+      1. Recherche topologique dans la base de connaissances (31 entrées) —
+         pour les questions sur RATIS (identité, LCT, TTF, ETH, ZK, etc.).
+      2. Génération LCT par le décodeur — pour les questions hors base, le
+         cerveau n'invente pas (ne dit pas "je ne sais pas" bêtement) : il
+         projette la question topologiquement, l'envoie au réseau LCT qui la
+         classifie, et le décodeur génère une réponse conditionnée par l'émotion
+         ressentie. C'est le VRAI langage généré par LCT, pas du copier-coller.
     """
 
     def __init__(self, eta: float = 0.2, Dc: float = 0.5, seed: int = 42):
@@ -81,6 +87,13 @@ class RatisBrain:
         self.c_seuil_stable = 0.6    # au-dessus = scène stable
         self.c_seuil_danger = 0.25    # en-dessous = danger
         self.P_sig_threshold = 0.5    # persistance min pour "structure cohérente"
+        # le vrai réseau LCT + décodeur (entraînés sur EmoContext)
+        self._net = None
+        self._decoder = None
+        self._cache = None
+        self._vocab = None
+        self._dialogue = None
+        self._trained = False
 
     # ── 1. PERCEVOIR : frame caméra → topologie ────────────────────────────
 
@@ -223,14 +236,106 @@ class RatisBrain:
         emotion = self.feel(sensors)
         return self.decide(perception, emotion)
 
-    # ── Dialogue (greffe du moteur de dialogue RATIS) ──────────────────────
+    # ── Dialogue (base de connaissances + génération LCT) ──────────────────
+
+    def train_dialogue(self, max_examples: int = 500, epochs: int = 5, top_k: int = 60):
+        """Entraîne le réseau LCT + décodeur sur EmoContext pour la génération.
+
+        Une fois entraîné, RATIS peut GÉNÉRER des réponses par LCT (pas du
+        copier-coller) : la question est projetée topologiquement, classifiée
+        par le réseau, et le décodeur génère une phrase conditionnée par
+        l'émotion ressentie.
+        """
+        if self._trained:
+            return
+        try:
+            from ratis_robot.ratis_net_v4 import RatisNetV4
+            from ratis_robot.emocontext_loader import (
+                load_emocontext, tokenize, balance_classes, vocabulary,
+            )
+            from ratis_robot.decoder import LCTDecoder, fit_bigram_from_emocontext
+            from ratis_robot.ttf_bridge import _hash_embedding
+            from pathlib import Path
+
+            data_path = Path(__file__).resolve().parents[1] / "data" / "emocontext" / "train.txt"
+            examples = load_emocontext(data_path, max_examples=max_examples)
+            self._net = RatisNetV4(n_in=12, n_hidden=10, n_out=3, eta=0.2, seed=42)
+            words = vocabulary([e for e in examples], min_len=2, top_k=top_k)
+            dim = 8
+            self._cache = {w: _hash_embedding(w, dim) for w in words}
+            self._vocab = [w for w in words if w in self._cache]
+
+            tr = examples[:int(0.8 * len(examples))]
+            samples = []
+            for e in tr:
+                ws = [w for w in tokenize(e["turn3"]) if w in self._cache]
+                if len(ws) < 2:
+                    continue
+                embs = np.array([self._cache[w] for w in ws])
+                norms = np.linalg.norm(embs, axis=1, keepdims=True)
+                norms[norms < 1e-9] = 1.0
+                seq_emb = (embs * norms).sum(axis=0) / norms.sum()
+                n = np.linalg.norm(seq_emb)
+                seq_emb = seq_emb / n if n > 1e-9 else seq_emb
+                samples.append((seq_emb, e["env"], e["label_num"], e["c_seuil"]))
+            samples = balance_classes(samples)
+            for ep in range(epochs):
+                for tok, env, label, cs in samples:
+                    self._net.train_step(tok, env, label, cs, t_step=ep, lr_eth=0.1)
+
+            class _LearnerAdapter:
+                def scores(self_, token, e):
+                    x = self._net._build_input(token, e)
+                    h = np.array([n.forward(x, 0) for n in self._net.hidden])
+                    return np.array([n.forward(h, 0) for n in self._net.output])
+                def predict(self_, token, e):
+                    return int(np.argmax(self_.scores(token, e)))
+
+            try:
+                bm = fit_bigram_from_emocontext(max_examples=3000)
+            except Exception:
+                bm = None
+            self._decoder = LCTDecoder(_LearnerAdapter(), self._cache, self._vocab, bm)
+            self._trained = True
+        except Exception as ex:
+            print(f"[RatisBrain] entraînement dialogue échoué : {ex}")
+            self._trained = False
 
     def answer(self, question: str) -> str:
-        """Répond à une question (moteur de dialogue topologique)."""
+        """Répond à une question — base de connaissances + génération LCT.
+
+        1. D'abord la recherche topologique dans la base (questions sur RATIS).
+        2. Si la base répond avec confiance → c'est la réponse (identité, LCT...).
+        3. Sinon → GÉNÉRATION LCT : le cerveau projette la question, classifie
+           l'émotion, et le décodeur génère une phrase. VRAI langage par LCT.
+        """
+        # 1. base de connaissances
         try:
-            from ratis_net.dialogue_engine import DialogueEngine
-            if not hasattr(self, "_dialogue"):
+            from ratis_robot.dialogue_engine import DialogueEngine
+            if self._dialogue is None:
                 self._dialogue = DialogueEngine()
-            return self._dialogue.chat(question)
+            r = self._dialogue.answer(question)
+            if r["found"] and r["confidence"] > 0.55:
+                return r["response"]
         except ImportError:
-            return f"Je suis RATIS. Question reçue : « {question[:100]} »."
+            pass
+
+        # 2. génération LCT (le vrai cerveau génère, pas du copier-coller)
+        if not self._trained:
+            self.train_dialogue()
+        if self._trained and self._decoder is not None:
+            from ratis_robot.eth_thermo_fixer import ThermoEnvironment
+            from ratis_robot.ttf_bridge import _hash_embedding
+            q_emb = _hash_embedding(question, 8)
+            env = ThermoEnvironment.calm()
+            x = self._net._build_input(q_emb, env)
+            h = np.array([n.forward(x, 0) for n in self._net.hidden])
+            out = np.array([n.forward(h, 0) for n in self._net.output])
+            pred = int(np.argmax(out))
+            emo_map = {0: "colère", 1: "joie", 2: "neutralité"}
+            emo = emo_map.get(pred, "neutralité")
+            emo_eng = {0: "angry", 1: "happy", 2: "others"}.get(pred, "others")
+            seq = self._decoder.generate_beam(emo_eng, env, length=6, beam_width=4)
+            phrase = " ".join(seq)
+            return f"Je ressens de la {emo}. Mon cerveau LCT génère : « {phrase} »"
+        return f"Je suis RATIS. Mon cerveau LCT projette « {question[:80]} » mais je n'ai pas encore assez de contexte pour répondre pleinement."
